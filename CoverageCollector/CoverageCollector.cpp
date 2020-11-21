@@ -5,17 +5,18 @@
 KNOB<std::string> TargetModule(KNOB_MODE_WRITEONCE, "pintool",
     "m", "null", "Target module to trace");
 
-// Default start and end address such that 
-// the condition InsAddress < StartAddress || InsAddress > EndAddress
-// always returns false unless a module is specified
+bool UseSpecificModule = false;
 ADDRINT StartAddress = 0;
-ADDRINT EndAddress = ~0;
+ADDRINT EndAddress = 0;
 
-auto pTraceFile = new std::ofstream("trace.txt",
+auto pTraceFile = new std::ofstream("Y:\\ReversingVlc\\trace.txt",
     std::ios::out | std::ios::binary);
 
-auto pLogFile = new std::ofstream("module_log.txt",
+auto pLogFile = new std::ofstream("Y:\\ReversingVlc\\module_log.txt",
     std::ios::out);
+
+std::vector<std::pair<uintptr_t, uintptr_t>> ModuleRanges;
+std::map<uintptr_t, std::string> ModuleNames;
 
 PIN_LOCK Lock;
 
@@ -24,14 +25,44 @@ InsAnalysisRoutine(ADDRINT InsAddress)
 {
     PIN_GetLock(&Lock, 0);
 
-    if (InsAddress < StartAddress || InsAddress > EndAddress)
-        return;
+    if (UseSpecificModule)
+    {
+        if (InsAddress > EndAddress || InsAddress < StartAddress)
+        {
+            PIN_ReleaseLock(&Lock);
+            return;
+        }
+    }
 
-    *pTraceFile << InsAddress << '\n';
+    // Search for module range
+    auto it = std::lower_bound(ModuleRanges.begin(), ModuleRanges.end(), InsAddress,
+        [](const std::pair<uintptr_t, uintptr_t>& ValA, const uintptr_t ValB)
+        {
+            return ValA.first < ValB;
+        });
+    
+    if (it == ModuleRanges.end() || it == ModuleRanges.begin())
+    {
+        PIN_ReleaseLock(&Lock);
+        return;
+    }
+
+    it--;
+
+    if (!(InsAddress >= it->first && InsAddress <= it->second))
+    {
+        PIN_ReleaseLock(&Lock);
+        return;
+    }
+
+    const auto& Range = *it;
+    const auto& ModName = ModuleNames[Range.first];
+
+    *pTraceFile << ModName << "+" << InsAddress - Range.first << '\n';
     
     // I know this is pretty bad for performance
     // But I am not sure how to gracefully terminate a program such that the PIN finish callback is invoked
-    pTraceFile->flush();
+    // pTraceFile->flush();
 
     PIN_ReleaseLock(&Lock);
 }
@@ -52,10 +83,7 @@ ImgInstrumentFunction(IMG Img, VOID* V)
     
     // Strip and get relative path name
     const auto RelativePathOffset = ImgName.find_last_of("/\\");
-    const auto RelativePath = ImgName.substr(RelativePathOffset);
-
-    const auto Start = IMG_StartAddress(Img);
-    const auto End = IMG_HighAddress(Img);
+    const auto RelativePath = ImgName.substr(RelativePathOffset + 1);
 
     // If we find the module specified in the target knob
     // Adjust Start and End so that the tool only traces within that module
@@ -65,7 +93,16 @@ ImgInstrumentFunction(IMG Img, VOID* V)
         EndAddress = IMG_HighAddress(Img);
     }
 
-    *pLogFile << RelativePath << "0x" << Start << ":0x" << End << std::endl;
+    auto It = std::lower_bound(ModuleRanges.begin(), ModuleRanges.end(), IMG_StartAddress(Img),
+        [] (const std::pair<uintptr_t, uintptr_t>& ValA, const uintptr_t ValB)
+        {
+            return ValA.first < ValB;
+        });
+
+    ModuleRanges.insert(It, std::pair<uintptr_t, uintptr_t>(IMG_StartAddress(Img), IMG_HighAddress(Img)));
+    ModuleNames[IMG_StartAddress(Img)] = RelativePath;
+
+    *pLogFile << "Module: " << RelativePath << " Start: 0x" << IMG_StartAddress(Img) << " End: 0x" << IMG_EntryAddress(Img) << std::endl;
 }
 
 VOID
@@ -83,10 +120,16 @@ main(INT32 Argc, CHAR **Argv)
         std::cout << "Pin could not start?" << std::endl;
 
     // Set the module log to std::hex
+    // Set the trace to std::hex
     *pLogFile << std::hex;
+    *pTraceFile << std::hex;
+
+    if (TargetModule.Value() != "null")
+        UseSpecificModule = true;
 
     INS_AddInstrumentFunction(InsInstrumentFunction, nullptr);
     IMG_AddInstrumentFunction(ImgInstrumentFunction, nullptr);
+
     PIN_AddFiniFunction(FiniCallback, nullptr);
 
     PIN_StartProgram();
